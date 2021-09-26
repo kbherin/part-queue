@@ -1,4 +1,5 @@
 import { Redis } from "ioredis";
+import { INVISIBILITY_CHECK_FREQ_MS, RETRY_ON_FAILURE } from "./constants";
 
 /**
  * Expire visibility of jobs in 'processing' set based on previously supplied timeout.
@@ -32,21 +33,21 @@ export function lockingQueueName(workQueue:string) {
 
 
 interface ProcessJobFunc {
-    (job: string|null) : void;
+    (job: string) : void;
 }
 /**
  * Dequeue a job for processing and mark it invisible for a duration.
  * @param redis 
  * @param workQueue 
- * @param processingSet 
+ * @param invisibleSet 
  * @param invisibilityTimeoutMs 
  * @returns 
  */
 export function workerFn(redis: Redis, workQueue:string,
-        processingSet:string, invisibilityTimeoutMs:number) {
+        invisibleSet:string, invisibilityTimeoutMs:number=INVISIBILITY_CHECK_FREQ_MS, retryCount=RETRY_ON_FAILURE) {
 
     const lockingQueue = lockingQueueName(workQueue);
-    const expireVisibility = expireVisibilityFn(redis, processingSet, workQueue);
+    const expireVisibility = expireVisibilityFn(redis, invisibleSet, workQueue);
 
     // To mock error every N attempts
     let loopCount = 0;
@@ -68,15 +69,14 @@ export function workerFn(redis: Redis, workQueue:string,
         // TODO: remove the error simulation.
         // Simulate error: Every 100th time the program fails midway
         if ((loopCount = ++loopCount % 100) === 0) {
-            console.error("MOCK - Error occurred while marking order as invisible. It will retried immediately.")
-            return null;
+            throw new Error("MOCK - Error occurred while marking order as invisible. It will be retried immediately.");
         }
 
         // Mark message as invisible until timeout
         const messageToProcess = await redis.eval(`
             local msg = redis.call("rpop", "${lockingQueue}");
             if (msg) then
-                redis.call("zadd", "${processingSet}", ARGV[1], msg);
+                redis.call("zadd", "${invisibleSet}", ARGV[1], msg);
             end
             return msg;
         `, 0, Date.now() + invisibilityTimeoutMs);
@@ -86,10 +86,22 @@ export function workerFn(redis: Redis, workQueue:string,
 
     return async (process:ProcessJobFunc) => {
         while (true) {
+            let retryRemaining = 1 + retryCount;
             try {
-                await process(await dequeueJob());
+                // Job can be null if queue is empty and waiting times out
+                const job = await dequeueJob();
+
+                while (job && retryRemaining-- > 0) {
+                    try {
+                        await process(job);
+                        await redis.zrem(invisibleSet, job);
+                        retryRemaining = 0;
+                    } catch (err) {
+                        console.error(err, "... Retrying");
+                    }
+                }
             } catch (err) {
-                console.error(err);
+                console.error("Exception occurred while dequeuing job.", err);
             }
         }
     };

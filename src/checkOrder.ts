@@ -1,10 +1,10 @@
 import { LocalConnection } from "./common/redisConnection";
 import { Order, Status } from "./model/order";
-import { ORDERS_LOOP, ORDERS_INVISIBLE, ORDERS_PORTFOLIO_UPDATE, ORDERS_ACCOUNT_LOOP, ORDERS_TERMINATED} from "./common/constants";
+import { ORDERS_LOOP, ORDERS_INVISIBLE, ORDERS_PORTFOLIO_UPDATE, ORDERS_ACCOUNT_LOOP, ORDERS_TERMINATED, RETRY_ON_FAILURE} from "./common/constants";
 import { workerFn, expireVisibilityFn, promoteUntil } from "./common/queueUtils";
 
 const redis = (new LocalConnection()).newConnection();
-const INVISIBILITY_TIMEOUT_MS = 1 * 1000;
+const INVISIBILITY_TIMEOUT_MS = 10 * 1000;
 
 const STATUSES: Status[] = ["FILLED", "CANCELED", "NEW", "PARTIALLY_FILLED", "PENDING", "QUEUED", "REJECTED"];
 const TERMINAL_STATUSES: Status[] = ["FILLED", "CANCELED", "REJECTED"];
@@ -54,22 +54,14 @@ function isOrderDone(order: Order|null) :boolean {
 
 function processOrderFn(checkOrderStatus: CheckOrderFunc, isOrderDone: OrderDoneFunc) {
 
-    return async function (orderStr: string|null) {
-        if (!orderStr) return;
-
+    return async function (orderStr: string) {
         const order = JSON.parse(orderStr);
         // Call broker API to check order status
-        let checkedOrder = null;
-        try {
-            checkedOrder = await checkOrderStatus(order);
-        } catch (err:any) {
-            console.error(err.message || err);
-            return;
-        }
+        let checkedOrder = await checkOrderStatus(order);
 
         const accountOrders = `${ORDERS_ACCOUNT_LOOP}:${checkedOrder.accountNo}`;
         const nextActionPipe = redis.pipeline();
-        nextActionPipe.zrem(ORDERS_INVISIBLE, orderStr);
+
         if (checkedOrder && checkedOrder.lastExecuted && isOrderDone(checkedOrder)) {
             console.log(`Order ${order.id} complete`);
             const checkedOrderStr = JSON.stringify(checkedOrder);
@@ -96,7 +88,7 @@ function processOrderFn(checkOrderStatus: CheckOrderFunc, isOrderDone: OrderDone
 }
 
 
-const ordersWorker = workerFn(redis, ORDERS_LOOP, ORDERS_INVISIBLE, INVISIBILITY_TIMEOUT_MS);
+const ordersWorker = workerFn(redis, ORDERS_LOOP, ORDERS_INVISIBLE, INVISIBILITY_TIMEOUT_MS, RETRY_ON_FAILURE);
 const processOrder = processOrderFn(checkOrderStatusAtBroker, isOrderDone);
 (async () => await ordersWorker(processOrder))();
 
