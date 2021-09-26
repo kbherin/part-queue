@@ -1,0 +1,27 @@
+{
+  "name": "status-poll",
+  "version": "1.0.0",
+  "description": "Poll status for a list of requests. If any of them is complete then those requests are put into a queue for processing downstream.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "tsc",
+    "test:neworder": "node dist/test/newOrder.js",
+    "monitor:orders-queue": "nodemon dist/src/checkOrder.js",
+    "monitor:orders-visibility": "nodemon dist/src/ordersVisibility.js"
+  },
+  "keywords": [
+    "queue",
+    "status"
+  ],
+  "author": "karthik.bp@gmail.com",
+  "license": "ISC",
+  "dependencies": {
+    "ioredis": "^4.27.9"
+  },
+  "devDependencies": {
+    "@types/ioredis": "^4.27.2",
+    "@types/node": "^16.9.1",
+    "typescript": "^4.4.2"
+  }
+}
