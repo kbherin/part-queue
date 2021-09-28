@@ -30,6 +30,9 @@ export function expireVisibilityFn(redis: Redis, invisibleSet:string, workQueue:
 export function lockingQueueName(workQueue:string) {
     return `${workQueue}:lock`;
 }
+export function invisibleSetName(workQueue:string) {
+    return `${workQueue}:invisible`;
+}
 
 
 interface ProcessJobFunc {
@@ -38,16 +41,17 @@ interface ProcessJobFunc {
 /**
  * Dequeue a job for processing and mark it invisible for a duration.
  * @param redis 
- * @param workQueue 
+ * @param jobsQueue 
  * @param invisibleSet 
  * @param invisibilityTimeoutMs 
  * @returns 
  */
-export function workerFn(redis: Redis, workQueue:string,
-        invisibleSet:string, invisibilityTimeoutMs:number=INVISIBILITY_CHECK_FREQ_MS, retryCount=RETRY_ON_FAILURE) {
+export function workerFn(redis: Redis, jobsQueue:string,
+        invisibilityTimeoutMs:number=INVISIBILITY_CHECK_FREQ_MS, retryCount=RETRY_ON_FAILURE) {
 
-    const lockingQueue = lockingQueueName(workQueue);
-    const expireVisibility = expireVisibilityFn(redis, invisibleSet, workQueue);
+    const lockingQueue = lockingQueueName(jobsQueue),
+          invisibleSet = invisibleSetName(jobsQueue);
+    const expireVisibility = expireVisibilityFn(redis, invisibleSet, jobsQueue);
 
     // To mock error every N attempts
     let loopCount = 0;
@@ -61,9 +65,9 @@ export function workerFn(redis: Redis, workQueue:string,
                 // Execute tasks from the locked queue
                 !(await redis.llen(lockingQueue)) &&
                 // Try popping a task for locking without blocking
-                !(await redis.rpoplpush(workQueue, lockingQueue)) &&
+                !(await redis.rpoplpush(jobsQueue, lockingQueue)) &&
                 // Pop a task for locking or block if queue is empty
-                !(await redis.brpoplpush(workQueue, lockingQueue, 15)))
+                !(await redis.brpoplpush(jobsQueue, lockingQueue, 15)))
             return null;
 
         // TODO: remove the error simulation.
@@ -145,6 +149,46 @@ export async function promoteUntil(redis: Redis,
     `;
     
     return redis.eval(releasedOrdersCmd, 0, sourceZset, predicateZset, targetZset, sortByZset).catch(err => console.error(err));
+}
+
+
+/**
+ * Mark a job as complete and reorder it in the grouped jobs queue according to completion timestamp, for next phase of processing. 
+ * @param redis
+ * @param jobSubmitted 
+ * @param jobCompleted 
+ * @param completionTimeMs 
+ * @param groupedJobsQueue 
+ * @param completedJobsSet 
+ */
+export async function markGroupJobComplete(redis:Redis, jobSubmitted:string, jobCompleted:string, completionTimeMs:number,
+    groupedJobsQueue:string, completedJobsSet:string) {
+
+    return redis.pipeline()
+        // Replace incomplete order with completed order in the account's orders queue
+        .zrem(groupedJobsQueue, jobSubmitted)
+        .zadd(groupedJobsQueue, Date.now(), jobCompleted)
+        // Mark the order as complete and record order execution time.
+        // Order execution time will be used to reorder the completed orders for portfolio update.
+        .zadd(completedJobsSet, completionTimeMs, jobCompleted)
+        .exec();
+}
+
+/**
+* To mark a job incomplete and reinsert at the tail of the grouped jobs queue and main jobs queue.
+* @param redis 
+* @param jobSubmitted 
+* @param groupedJobsQueue 
+* @param jobsQueue 
+*/
+export async function markGroupJobIncomplete(redis:Redis, jobSubmitted:string, groupedJobsQueue:string, jobsQueue:string) {
+
+    return redis.pipeline()
+        // Update last checked time in account's orders queue. This releases completed orders stuck behind an incomplete order.
+        .zadd(groupedJobsQueue, Date.now(), jobSubmitted)
+        // And cycle the order to the back of orders loop.
+        .lpush(jobsQueue, jobSubmitted)
+        .exec();
 }
 
 /**

@@ -1,4 +1,4 @@
-export type Status = "NEW" | "FILLED" | "PARTIALLY_FILLED" | "REJECTED" | "PENDING" | "CANCELED" | "QUEUED";
+export type Status = "NEW" | "FILLED" | "PARTIAL_FILL" | "REJECTED" | "PENDING" | "CANCELED" | "QUEUED";
 
 export interface Order {
     id: string,

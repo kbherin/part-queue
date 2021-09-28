@@ -1,12 +1,12 @@
 import { LocalConnection } from "./common/redisConnection";
 import { Order, Status } from "./model/order";
-import { ORDERS_LOOP, ORDERS_INVISIBLE, ORDERS_PORTFOLIO_UPDATE, ORDERS_ACCOUNT_LOOP, ORDERS_TERMINATED, RETRY_ON_FAILURE} from "./common/constants";
-import { workerFn, expireVisibilityFn, promoteUntil } from "./common/queueUtils";
+import { ORDERS_LOOP, ORDERS_TERMINATED, ORDERS_PORTFOLIO_UPDATE, RETRY_ON_FAILURE} from "./common/constants";
+import { workerFn, expireVisibilityFn, promoteUntil, markGroupJobIncomplete, markGroupJobComplete } from "./common/queueUtils";
 
 const redis = (new LocalConnection()).newConnection();
 const INVISIBILITY_TIMEOUT_MS = 10 * 1000;
 
-const STATUSES: Status[] = ["FILLED", "CANCELED", "NEW", "PARTIALLY_FILLED", "PENDING", "QUEUED", "REJECTED"];
+const STATUSES: Status[] = ["FILLED", "CANCELED", "NEW", "PARTIAL_FILL", "PENDING", "QUEUED", "REJECTED"];
 const TERMINAL_STATUSES: Status[] = ["FILLED", "CANCELED", "REJECTED"];
 
 interface CheckOrderFunc {
@@ -59,28 +59,21 @@ function processOrderFn(checkOrderStatus: CheckOrderFunc, isOrderDone: OrderDone
         // Call broker API to check order status
         let checkedOrder = await checkOrderStatus(order);
 
-        const accountOrders = `${ORDERS_ACCOUNT_LOOP}:${checkedOrder.accountNo}`;
-        const nextActionPipe = redis.pipeline();
+        const accountOrders = `${ORDERS_LOOP}:account:${checkedOrder.accountNo}`;
 
         if (checkedOrder && checkedOrder.lastExecuted && isOrderDone(checkedOrder)) {
             console.log(`Order ${order.id} complete`);
             const checkedOrderStr = JSON.stringify(checkedOrder);
-            nextActionPipe
-                    // Replace incomplete order with completed order in the account's orders queue
-                    .zrem(accountOrders, orderStr)
-                    .zadd(accountOrders, Date.now(), checkedOrderStr)
-                    // Mark the order as complete and record order execution time.
-                    // Order execution time will be used to reorder the completed orders for portfolio update.
-                    .zadd(ORDERS_TERMINATED, checkedOrder.lastExecuted?.getTime() || Date.now(), checkedOrderStr);
+            // Replace incomplete order with completed order in the account's orders queue.
+            // Mark the order as complete and record order execution time.
+            // Order execution time will be used to reorder the completed orders for portfolio update.
+            await markGroupJobComplete(redis, orderStr, checkedOrderStr, checkedOrder.lastExecuted.getTime(), accountOrders, ORDERS_TERMINATED);
         } else {
             console.log(`Order ${order.id} incomplete`);
-            nextActionPipe
-                    // Update last checked time in account's orders queue. This releases completed orders stuck behind an incomplete order.
-                    .zadd(accountOrders, Date.now(), orderStr)
-                    // And cycle the order to the back of orders loop.
-                    .lpush(ORDERS_LOOP, orderStr);
+            // Update last checked time in account's orders queue. This releases completed orders stuck behind an incomplete order.
+            // And cycle the order to the back of orders loop.
+            await markGroupJobIncomplete(redis, orderStr, accountOrders, ORDERS_LOOP);
         }
-        await nextActionPipe.exec();
 
         const releasedOrdersCount = await promoteUntil(redis, accountOrders, ORDERS_TERMINATED, ORDERS_PORTFOLIO_UPDATE);
         console.log(releasedOrdersCount + " orders ready for updating portfolios");
@@ -88,7 +81,7 @@ function processOrderFn(checkOrderStatus: CheckOrderFunc, isOrderDone: OrderDone
 }
 
 
-const ordersWorker = workerFn(redis, ORDERS_LOOP, ORDERS_INVISIBLE, INVISIBILITY_TIMEOUT_MS, RETRY_ON_FAILURE);
+const ordersWorker = workerFn(redis, ORDERS_LOOP, INVISIBILITY_TIMEOUT_MS, RETRY_ON_FAILURE);
 const processOrder = processOrderFn(checkOrderStatusAtBroker, isOrderDone);
 (async () => await ordersWorker(processOrder))();
 
