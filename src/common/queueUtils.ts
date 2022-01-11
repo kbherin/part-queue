@@ -1,6 +1,8 @@
 import { Redis } from "ioredis";
 import { INVISIBILITY_CHECK_FREQ_MS, RETRY_ON_FAILURE } from "./constants";
 
+export interface DequeueJob {job:string, ts:number}
+
 /**
  * Expire visibility of jobs in 'processing' set based on previously supplied timeout.
  * @param redis
@@ -33,10 +35,13 @@ export function lockingQueueName(workQueue:string) {
 export function invisibleSetName(workQueue:string) {
     return `${workQueue}:invisible`;
 }
+export function incompleteTimeoutSetName(workQueue:string) {
+    return `${workQueue}:incompletetimeout`;
+}
 
 
 interface ProcessJobFunc {
-    (job: string) : void;
+    (job: DequeueJob) : Promise<void>;
 }
 /**
  * Dequeue a job for processing and mark it invisible for a duration.
@@ -56,7 +61,7 @@ export function workerFn(redis: Redis, jobsQueue:string,
     // To mock error every N attempts
     let loopCount = 0;
 
-    const dequeueJob = async () : Promise<string|null> => {
+    const dequeueJob = async () : Promise<DequeueJob|null> => {
 
         // Move tasks marked as invisible whose timeout has elapsed.
         expireVisibility();
@@ -77,15 +82,20 @@ export function workerFn(redis: Redis, jobsQueue:string,
         }
 
         // Mark message as invisible until timeout
-        const messageToProcess = await redis.eval(`
+        const messageTs = await redis.eval(`
             local msg = redis.call("rpop", "${lockingQueue}");
+            local ts = redis.call("time")[1]
             if (msg) then
-                redis.call("zadd", "${invisibleSet}", ARGV[1], msg);
+                redis.call("zadd", "${invisibleSet}", ts+ARGV[1], msg);
             end
-            return msg;
-        `, 0, Date.now() + invisibilityTimeoutMs);
+            return {msg, ts};
+        `, 0, invisibilityTimeoutMs);
 
-        return messageToProcess;
+        if (!messageTs[0]) {
+            return null;
+        }
+
+        return {job: messageTs[0], ts: Number.parseInt(messageTs[1])};
     };
 
     return async (process:ProcessJobFunc) => {
@@ -98,7 +108,7 @@ export function workerFn(redis: Redis, jobsQueue:string,
                 while (job && retryRemaining-- > 0) {
                     try {
                         await process(job);
-                        await redis.zrem(invisibleSet, job);
+                        await redis.zrem(invisibleSet, job.job);
                         retryRemaining = 0;
                     } catch (err) {
                         console.error(err, "... Retrying");
@@ -111,6 +121,17 @@ export function workerFn(redis: Redis, jobsQueue:string,
     };
 }
 
+/**
+ * Moves tasks from sourceZset to targetZset if it exists in predicateZset.
+ * Score in target set is by the score in predicate if target is different from source.
+ * Otherwise it is scored by the score in source set.
+ * @param redis 
+ * @param sourceZset 
+ * @param predicateZset 
+ * @param targetZset 
+ * @param sortByZset 
+ * @returns 
+ */
 export async function promoteUntil(redis: Redis,
         sourceZset:string, predicateZset:string, targetZset:string, sortByZset=predicateZset) {
 
@@ -147,8 +168,21 @@ export async function promoteUntil(redis: Redis,
     until(false)
     return count
     `;
+
+    // const releasedOrdersCmd = `
+    // local sourceZset, predicateZset, targetZset, sortByZset = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
+    // -- Temporary target set name formed by concatenating source and target names
+    // local tmpTarget = sourceZset..targetZset
+    // local count = redis.call("zinterstore", tmpTarget, 2, sourceZset, predicateZset, "WEIGHTS", 0, 1)
+    // -- Append all elements in {tmpTarget - target}
+    // redis.call("zunionstore", targetZset, 2, targetZset, tmpTarget, "WEIGHTS", 1, 1)
+    // redis.call("del", tmpTarget)
+    // return count
+    // `;
     
-    return redis.eval(releasedOrdersCmd, 0, sourceZset, predicateZset, targetZset, sortByZset).catch(err => console.error(err));
+    return redis
+        .eval(releasedOrdersCmd, 0, sourceZset, predicateZset, targetZset, sortByZset)
+        .catch(err => console.error(err));
 }
 
 
@@ -161,13 +195,13 @@ export async function promoteUntil(redis: Redis,
  * @param groupedJobsQueue 
  * @param completedJobsSet 
  */
-export async function markGroupJobComplete(redis:Redis, jobSubmitted:string, jobCompleted:string, completionTimeMs:number,
+export async function markGroupJobComplete(redis:Redis, jobSubmitted:DequeueJob, jobCompleted:string, completionTimeMs:number,
     groupedJobsQueue:string, completedJobsSet:string) {
 
     return redis.pipeline()
         // Replace incomplete order with completed order in the account's orders queue
-        .zrem(groupedJobsQueue, jobSubmitted)
-        .zadd(groupedJobsQueue, Date.now(), jobCompleted)
+        .zrem(groupedJobsQueue, jobSubmitted.job)
+        .zadd(groupedJobsQueue, jobSubmitted.ts, jobCompleted)
         // Mark the order as complete and record order execution time.
         // Order execution time will be used to reorder the completed orders for portfolio update.
         .zadd(completedJobsSet, completionTimeMs, jobCompleted)
@@ -181,13 +215,14 @@ export async function markGroupJobComplete(redis:Redis, jobSubmitted:string, job
 * @param groupedJobsQueue 
 * @param jobsQueue 
 */
-export async function markGroupJobIncomplete(redis:Redis, jobSubmitted:string, groupedJobsQueue:string, jobsQueue:string) {
+export async function markGroupJobIncomplete(redis:Redis, jobSubmitted:DequeueJob, groupedJobsQueue:string, jobsQueue:string) {
 
     return redis.pipeline()
         // Update last checked time in account's orders queue. This releases completed orders stuck behind an incomplete order.
-        .zadd(groupedJobsQueue, Date.now(), jobSubmitted)
+        .zadd(groupedJobsQueue, jobSubmitted.ts, jobSubmitted.job)
+        .zadd(incompleteTimeoutSetName(jobsQueue), Date.now()+5000, jobSubmitted.job)
         // And cycle the order to the back of orders loop.
-        .lpush(jobsQueue, jobSubmitted)
+        // .lpush(jobsQueue, jobSubmitted.job)
         .exec();
 }
 
