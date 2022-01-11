@@ -1,5 +1,5 @@
 import { Redis } from "ioredis";
-import { INVISIBILITY_CHECK_FREQ_MS, RETRY_ON_FAILURE } from "./constants";
+import { INVISIBILITY_CHECK_FREQ_MS, PRIORITY_RETRY_QUEUE_EVICT_MS, RETRY_ON_FAILURE } from "./constants";
 
 export interface DequeueJob {job:string, ts:number}
 
@@ -10,22 +10,34 @@ export interface DequeueJob {job:string, ts:number}
  * @param workQueue 
  * @returns 
  */
-export function expireVisibilityFn(redis: Redis, invisibleSet:string, workQueue:string) {
-    return () => {
-        return redis.eval(`
-            local currentTime = ARGV[1]
+export function expireVisibilityFn(redis: Redis, invisibleSet:string, workQueue:string, atBack = true) {
+    return async () => {
+        const count = await redis.eval(`
+            local currentTime, atBack = ARGV[1], ARGV[2]
             local msgs = redis.call("zrangebyscore", "${invisibleSet}", 0, currentTime);
             if (table.getn(msgs) > 0) then
                 if (unpack) then
-                    redis.call("lpush", "${workQueue}", unpack(msgs));
+                    if (atBack == "0") then
+                        redis.call("rpush", "${workQueue}", unpack(msgs));
+                    else
+                        redis.call("lpush", "${workQueue}", unpack(msgs));
+                    end
                 else
                     if (table.unpack) then
-                        redis.call("lpush", "${workQueue}", table.unpack(msgs));
+                        if (atBack == "0") then
+                            redis.call("rpush", "${workQueue}", table.unpack(msgs));
+                        else
+                            redis.call("lpush", "${workQueue}", table.unpack(msgs));
+                        end
                     end
                 end
                 return redis.call("zremrangebyscore", "${invisibleSet}", 0, currentTime);
             end
-        `, 0, Date.now());
+        `, 0, Date.now(), atBack ? "1" : "0");
+        if (count) {
+            console.debug(`Evicted ${count} records from invisible set to the ${atBack ? 'back' : 'front'} of main queue`);
+        }
+        return count;
     }
 }
 
@@ -35,8 +47,8 @@ export function lockingQueueName(workQueue:string) {
 export function invisibleSetName(workQueue:string) {
     return `${workQueue}:invisible`;
 }
-export function incompleteTimeoutSetName(workQueue:string) {
-    return `${workQueue}:incompletetimeout`;
+export function priorityRetrySetName(workQueue:string) {
+    return `${workQueue}:priorityretry`;
 }
 
 
@@ -84,7 +96,9 @@ export function workerFn(redis: Redis, jobsQueue:string,
         // Mark message as invisible until timeout
         const messageTs = await redis.eval(`
             local msg = redis.call("rpop", "${lockingQueue}");
-            local ts = redis.call("time")[1]
+            local ts = redis.call("time")
+            local sec, usec = ts[1], ts[2]
+            ts = sec*1000 + usec/1000
             if (msg) then
                 redis.call("zadd", "${invisibleSet}", ts+ARGV[1], msg);
             end
@@ -196,7 +210,7 @@ export async function promoteUntil(redis: Redis,
  * @param completedJobsSet 
  */
 export async function markGroupJobComplete(redis:Redis, jobSubmitted:DequeueJob, jobCompleted:string, completionTimeMs:number,
-    groupedJobsQueue:string, completedJobsSet:string) {
+    groupedJobsQueue:string, completedJobsSet:string, jobsQueue:string) {
 
     return redis.pipeline()
         // Replace incomplete order with completed order in the account's orders queue
@@ -205,6 +219,7 @@ export async function markGroupJobComplete(redis:Redis, jobSubmitted:DequeueJob,
         // Mark the order as complete and record order execution time.
         // Order execution time will be used to reorder the completed orders for portfolio update.
         .zadd(completedJobsSet, completionTimeMs, jobCompleted)
+        .zrem(invisibleSetName(jobsQueue), jobSubmitted.job)
         .exec();
 }
 
@@ -220,9 +235,11 @@ export async function markGroupJobIncomplete(redis:Redis, jobSubmitted:DequeueJo
     return redis.pipeline()
         // Update last checked time in account's orders queue. This releases completed orders stuck behind an incomplete order.
         .zadd(groupedJobsQueue, jobSubmitted.ts, jobSubmitted.job)
-        .zadd(incompleteTimeoutSetName(jobsQueue), Date.now()+5000, jobSubmitted.job)
+        // Add to retry-after set
+        .zadd(priorityRetrySetName(jobsQueue), Date.now()+PRIORITY_RETRY_QUEUE_EVICT_MS, jobSubmitted.job)
         // And cycle the order to the back of orders loop.
         // .lpush(jobsQueue, jobSubmitted.job)
+        .zrem(invisibleSetName(jobsQueue), jobSubmitted.job)
         .exec();
 }
 

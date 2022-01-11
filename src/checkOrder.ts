@@ -68,7 +68,7 @@ function processOrderFn(checkOrderStatus: CheckOrderFunc, isOrderDone: OrderDone
             // Replace incomplete order with completed order in the account's orders queue.
             // Mark the order as complete and record order execution time.
             // Order execution time will be used to reorder the completed orders for portfolio update.
-            await markGroupJobComplete(redis, dequeuedOrder, checkedOrderStr, checkedOrder.lastExecuted.getTime(), accountOrders, ORDERS_TERMINATED);
+            await markGroupJobComplete(redis, dequeuedOrder, checkedOrderStr, checkedOrder.lastExecuted.getTime(), accountOrders, ORDERS_TERMINATED, ORDERS_LOOP);
         } else {
             console.log(`Order ${order.id} incomplete`);
             // Update last checked time in account's orders queue. This releases completed orders stuck behind an incomplete order.

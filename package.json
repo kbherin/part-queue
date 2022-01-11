@@ -7,8 +7,8 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "build": "tsc",
     "test:neworder": "node dist/test/newOrder.js",
-    "monitor:orders-queue": "nodemon dist/src/checkOrder.js",
-    "monitor:orders-visibility": "nodemon dist/src/ordersVisibility.js"
+    "monitor:orders-queue": "node dist/src/checkOrder.js",
+    "monitor:orders-visibility": "node dist/src/ordersVisibility.js"
   },
   "keywords": [
     "queue",
