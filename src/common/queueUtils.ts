@@ -47,8 +47,10 @@ export function workerFn(redis: Redis, jobsQueue:string,
         invisibilityTimeoutMs:number=INVISIBILITY_CHECK_FREQ_MS, retryCount=RETRY_ON_FAILURE) {
 
     const lockingQueue = lockingQueueName(jobsQueue),
-          invisibleSet = invisibleSetName(jobsQueue);
+          invisibleSet = invisibleSetName(jobsQueue),
+          priorityRetrySet = priorityRetrySetName(jobsQueue);
     const expireVisibility = expireVisibilityFn(redis, invisibleSet, jobsQueue);
+    const evictPriorityRetry = expireVisibilityFn(redis, priorityRetrySet, jobsQueue, false);
 
     // To mock error every N attempts
     let loopCount = 0;
@@ -56,6 +58,7 @@ export function workerFn(redis: Redis, jobsQueue:string,
     const dequeueJob = async () : Promise<DequeueJob|null> => {
 
         // Move tasks marked as invisible whose timeout has elapsed.
+        evictPriorityRetry();
         expireVisibility();
 
         if (

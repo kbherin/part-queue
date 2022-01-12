@@ -14,7 +14,7 @@ const invisibleOrders = invisibleSetName(ORDERS_LOOP);
 const priorityRetryOrders = priorityRetrySetName(ORDERS_LOOP);
 
 const expireVisibility = expireVisibilityFn(redis, invisibleOrders, ORDERS_LOOP);
-const retryPendingAfterTimeout = expireVisibilityFn(redis, priorityRetryOrders, ORDERS_LOOP, false);
+const evictPriorityRetry = expireVisibilityFn(redis, priorityRetryOrders, ORDERS_LOOP, false);
 
 function countsTracker() {
     let prev_totalPending = -1, 
@@ -23,7 +23,7 @@ function countsTracker() {
     const lockedOrders = lockingQueueName(ORDERS_LOOP);
 
     return async () => {
-        await retryPendingAfterTimeout();
+        await evictPriorityRetry();
         await expireVisibility();
 
         // Logging count of messages in the flow
