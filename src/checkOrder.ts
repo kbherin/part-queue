@@ -1,9 +1,13 @@
 import { LocalConnection } from "./common/redisConnection";
 import { Order } from "./model/order";
 import { ORDERS_LOOP, ORDERS_TERMINATED, ORDERS_PORTFOLIO_UPDATE, RETRY_ON_FAILURE} from "./common/constants";
-import { workerFn, expireVisibilityFn, promoteUntil, markGroupJobIncomplete, markGroupJobComplete, DequeueJob } from "./common/queueUtils";
+import { workerFn, promoteUntil, markGroupJobIncomplete, markGroupJobComplete, DequeueJob,
+    expireInvisibilityRedisFn, markInvisibleRedisFn, promoteUntilRedisFn } from "./common/queueUtils";
 
 const redis = (new LocalConnection()).newConnection();
+expireInvisibilityRedisFn(redis);
+markInvisibleRedisFn(redis);
+promoteUntilRedisFn(redis);
 const INVISIBILITY_TIMEOUT_MS = 10 * 1000;
 
 const STATUSES: string[] = ["FILLED", "CANCELED", "NEW", "PARTIAL_FILL", "PENDING", "QUEUED", "REJECTED"];

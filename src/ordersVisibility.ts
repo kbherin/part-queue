@@ -1,5 +1,5 @@
 import { INVISIBILITY_CHECK_FREQ_MS, ORDERS_LOOP, ORDERS_TERMINATED, ORDERS_PORTFOLIO_UPDATE } from "./common/constants";
-import { expireVisibilityFn, invisibleSetName, lockingQueueName, priorityRetrySetName, queueSizes } from "./common/queueUtils";
+import { expireVisibilityFn, invisibleSetName, lockingQueueName, priorityRetrySetName, queueSizes, expireInvisibilityRedisFn } from "./common/queueUtils";
 import { LocalConnection } from "./common/redisConnection";
 
 /**
@@ -7,6 +7,7 @@ import { LocalConnection } from "./common/redisConnection";
  */
 
 const redis = new LocalConnection().newConnection();
+expireInvisibilityRedisFn(redis);
 
 const invisibleOrders = invisibleSetName(ORDERS_LOOP);
 

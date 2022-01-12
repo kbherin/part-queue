@@ -12,28 +12,8 @@ export interface DequeueJob {job:string, ts:number}
  */
 export function expireVisibilityFn(redis: Redis, invisibleSet:string, workQueue:string, atBack = true) {
     return async () => {
-        const count = await redis.eval(`
-            local currentTime, atBack = ARGV[1], ARGV[2]
-            local msgs = redis.call("zrangebyscore", "${invisibleSet}", 0, currentTime);
-            if (table.getn(msgs) > 0) then
-                if (unpack) then
-                    if (atBack == "0") then
-                        redis.call("rpush", "${workQueue}", unpack(msgs));
-                    else
-                        redis.call("lpush", "${workQueue}", unpack(msgs));
-                    end
-                else
-                    if (table.unpack) then
-                        if (atBack == "0") then
-                            redis.call("rpush", "${workQueue}", table.unpack(msgs));
-                        else
-                            redis.call("lpush", "${workQueue}", table.unpack(msgs));
-                        end
-                    end
-                end
-                return redis.call("zremrangebyscore", "${invisibleSet}", 0, currentTime);
-            end
-        `, 0, Date.now(), atBack ? "1" : "0");
+        // @ts-ignore
+        const count = await redis.expireInvisibility(invisibleSet, workQueue, Date.now(), atBack ? "1" : "0");
         if (count) {
             console.debug(`Evicted ${count} records from invisible set to the ${atBack ? 'back' : 'front'} of main queue`);
         }
@@ -94,16 +74,8 @@ export function workerFn(redis: Redis, jobsQueue:string,
         }
 
         // Mark message as invisible until timeout
-        const messageTs = await redis.eval(`
-            local msg = redis.call("rpop", "${lockingQueue}");
-            local ts = redis.call("time")
-            local sec, usec = ts[1], ts[2]
-            ts = sec*1000 + usec/1000
-            if (msg) then
-                redis.call("zadd", "${invisibleSet}", ts+ARGV[1], msg);
-            end
-            return {msg, ts};
-        `, 0, invisibilityTimeoutMs);
+        // @ts-ignore
+        const messageTs = await redis.markInvisible(lockingQueue, invisibleSet, invisibilityTimeoutMs);
 
         if (!messageTs[0]) {
             return null;
@@ -153,50 +125,9 @@ export async function promoteUntil(redis: Redis,
         throw new Error("sortByZset should be either sourceZset or predicateZset");
     }
 
-    const releasedOrdersCmd = `
-    local sourceZset, predicateZset, targetZset, sortByZset = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
-    local count = 0
-    repeat
-        local msgs = redis.call("zrange", sourceZset, 0, 0)
-        if (#msgs > 0) then
-            local rankInPredSet = redis.call("zrank", predicateZset, msgs[1])
-            if (rankInPredSet) then
-                local itemScore = redis.call("zpopmin", sourceZset)
-                local srcItem, srcScore = itemScore[1], itemScore[2]
-                if (targetZset == sourceZset) then
-                    redis.call("zadd", targetZset, srcScore, srcItem)
-                else
-                    local scoreInPredSet = redis.call("zscore", predicateZset, srcItem)
-                    redis.call("zadd", targetZset, scoreInPredSet, srcItem)
-                end
-                redis.call("zremrangebyrank", predicateZset, rankInPredSet, rankInPredSet)
-                count = count + 1
-            else
-                -- Block until the order in the front of the account orders queue is terminated
-                break
-            end
-        else
-            -- Nothing in the account orders queue
-            break
-        end
-    until(false)
-    return count
-    `;
-
-    // const releasedOrdersCmd = `
-    // local sourceZset, predicateZset, targetZset, sortByZset = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
-    // -- Temporary target set name formed by concatenating source and target names
-    // local tmpTarget = sourceZset..targetZset
-    // local count = redis.call("zinterstore", tmpTarget, 2, sourceZset, predicateZset, "WEIGHTS", 0, 1)
-    // -- Append all elements in {tmpTarget - target}
-    // redis.call("zunionstore", targetZset, 2, targetZset, tmpTarget, "WEIGHTS", 1, 1)
-    // redis.call("del", tmpTarget)
-    // return count
-    // `;
-    
-    return redis
-        .eval(releasedOrdersCmd, 0, sourceZset, predicateZset, targetZset, sortByZset)
-        .catch(err => console.error(err));
+    // @ts-ignore
+    return redis.promoteUntil(sourceZset, predicateZset, targetZset, sortByZset)
+        .catch((err:any) => console.error(err));
 }
 
 
@@ -274,4 +205,88 @@ export async function markGroupJobIncomplete(redis:Redis, jobSubmitted:DequeueJo
         firstCmd = false;
     }
     return redis.eval(`return {${cmds}}`, 0);
+}
+
+export function expireInvisibilityRedisFn(redis: Redis) :Redis {
+    redis.defineCommand("expireInvisibility", {
+        numberOfKeys: 0,
+        lua: `
+            local invisibleSet, workQueue, currentTime, atBack = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
+            local msgs = redis.call("zrangebyscore", invisibleSet, 0, currentTime);
+            if (table.getn(msgs) > 0) then
+                if (unpack) then
+                    if (atBack == "0") then
+                        redis.call("rpush", workQueue, unpack(msgs));
+                    else
+                        redis.call("lpush", workQueue, unpack(msgs));
+                    end
+                else
+                    if (table.unpack) then
+                        if (atBack == "0") then
+                            redis.call("rpush", workQueue, table.unpack(msgs));
+                        else
+                            redis.call("lpush", workQueue, table.unpack(msgs));
+                        end
+                    end
+                end
+                return redis.call("zremrangebyscore", invisibleSet, 0, currentTime);
+            end
+            return 0
+        `
+    });
+    return redis;
+}
+
+export function markInvisibleRedisFn(redis: Redis) :Redis {
+    redis.defineCommand('markInvisible', {
+        numberOfKeys: 0,
+        lua: `
+            local lockingQueue, invisibleSet, invisibilityTimeoutMs = ARGV[1], ARGV[2], ARGV[3]
+            local msg = redis.call("rpop", lockingQueue);
+            local ts = redis.call("time")
+            local sec, usec = ts[1], ts[2]
+            ts = sec*1000 + usec/1000
+            if (msg) then
+                redis.call("zadd", invisibleSet, ts+invisibilityTimeoutMs, msg)
+            end
+            return {msg, ts}
+        `
+    });
+    return redis;
+}
+
+export function promoteUntilRedisFn(redis: Redis) :Redis {
+    redis.defineCommand('promoteUntil', {
+        numberOfKeys: 0,
+        lua: `
+            local sourceZset, predicateZset, targetZset, sortByZset = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
+            local count = 0
+            repeat
+                local msgs = redis.call("zrange", sourceZset, 0, 0)
+                if (#msgs > 0) then
+                    local rankInPredSet = redis.call("zrank", predicateZset, msgs[1])
+                    if (rankInPredSet) then
+                        local itemScore = redis.call("zpopmin", sourceZset)
+                        local srcItem, srcScore = itemScore[1], itemScore[2]
+                        if (targetZset == sourceZset) then
+                            redis.call("zadd", targetZset, srcScore, srcItem)
+                        else
+                            local scoreInPredSet = redis.call("zscore", predicateZset, srcItem)
+                            redis.call("zadd", targetZset, scoreInPredSet, srcItem)
+                        end
+                        redis.call("zremrangebyrank", predicateZset, rankInPredSet, rankInPredSet)
+                        count = count + 1
+                    else
+                        -- Block until the order in the front of the account orders queue is terminated
+                        break
+                    end
+                else
+                    -- Nothing in the account orders queue
+                    break
+                end
+            until(false)
+            return count
+        `
+    });
+    return redis;
 }
