@@ -1,13 +1,17 @@
 import { LocalConnection } from "./common/redisConnection";
-import { Order, Status } from "./model/order";
+import { Order } from "./model/order";
 import { ORDERS_LOOP, ORDERS_TERMINATED, ORDERS_PORTFOLIO_UPDATE, RETRY_ON_FAILURE} from "./common/constants";
-import { workerFn, expireVisibilityFn, promoteUntil, markGroupJobIncomplete, markGroupJobComplete } from "./common/queueUtils";
+import { workerFn, promoteUntil, markGroupJobIncomplete, markGroupJobComplete, DequeueJob,
+    expireInvisibilityRedisFn, markInvisibleRedisFn, promoteUntilRedisFn } from "./common/queueUtils";
 
 const redis = (new LocalConnection()).newConnection();
+expireInvisibilityRedisFn(redis);
+markInvisibleRedisFn(redis);
+promoteUntilRedisFn(redis);
 const INVISIBILITY_TIMEOUT_MS = 10 * 1000;
 
-const STATUSES: Status[] = ["FILLED", "CANCELED", "NEW", "PARTIAL_FILL", "PENDING", "QUEUED", "REJECTED"];
-const TERMINAL_STATUSES: Status[] = ["FILLED", "CANCELED", "REJECTED"];
+const STATUSES: string[] = ["FILLED", "CANCELED", "NEW", "PARTIAL_FILL", "PENDING", "QUEUED", "REJECTED"];
+const TERMINAL_STATUSES: string[] = ["FILLED", "CANCELED", "REJECTED"];
 
 interface CheckOrderFunc {
     (order: Order) : Promise<Order>;
@@ -49,12 +53,13 @@ interface OrderDoneFunc {
 }
 // Tests completion of order execution.
 function isOrderDone(order: Order|null) :boolean {
-    return !!order && (order.status === "FILLED" || order.status === "REJECTED" || order.status === "CANCELED");
+    return !!order && TERMINAL_STATUSES.indexOf(order.status || '') > -1;
 }
 
 function processOrderFn(checkOrderStatus: CheckOrderFunc, isOrderDone: OrderDoneFunc) {
 
-    return async function (orderStr: string) {
+    return async function (dequeuedOrder: DequeueJob) {
+        const orderStr: string = dequeuedOrder.job;
         const order = JSON.parse(orderStr);
         // Call broker API to check order status
         let checkedOrder = await checkOrderStatus(order);
@@ -67,12 +72,12 @@ function processOrderFn(checkOrderStatus: CheckOrderFunc, isOrderDone: OrderDone
             // Replace incomplete order with completed order in the account's orders queue.
             // Mark the order as complete and record order execution time.
             // Order execution time will be used to reorder the completed orders for portfolio update.
-            await markGroupJobComplete(redis, orderStr, checkedOrderStr, checkedOrder.lastExecuted.getTime(), accountOrders, ORDERS_TERMINATED);
+            await markGroupJobComplete(redis, dequeuedOrder, checkedOrderStr, checkedOrder.lastExecuted.getTime(), accountOrders, ORDERS_TERMINATED, ORDERS_LOOP);
         } else {
             console.log(`Order ${order.id} incomplete`);
             // Update last checked time in account's orders queue. This releases completed orders stuck behind an incomplete order.
             // And cycle the order to the back of orders loop.
-            await markGroupJobIncomplete(redis, orderStr, accountOrders, ORDERS_LOOP);
+            await markGroupJobIncomplete(redis, dequeuedOrder, accountOrders, ORDERS_LOOP);
         }
 
         const releasedOrdersCount = await promoteUntil(redis, accountOrders, ORDERS_TERMINATED, ORDERS_PORTFOLIO_UPDATE);

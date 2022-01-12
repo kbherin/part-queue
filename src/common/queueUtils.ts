@@ -1,5 +1,7 @@
 import { Redis } from "ioredis";
-import { INVISIBILITY_CHECK_FREQ_MS, RETRY_ON_FAILURE } from "./constants";
+import { INVISIBILITY_CHECK_FREQ_MS, PRIORITY_RETRY_QUEUE_EVICT_MS, RETRY_ON_FAILURE } from "./constants";
+
+export interface DequeueJob {job:string, ts:number}
 
 /**
  * Expire visibility of jobs in 'processing' set based on previously supplied timeout.
@@ -8,22 +10,14 @@ import { INVISIBILITY_CHECK_FREQ_MS, RETRY_ON_FAILURE } from "./constants";
  * @param workQueue 
  * @returns 
  */
-export function expireVisibilityFn(redis: Redis, invisibleSet:string, workQueue:string) {
-    return () => {
-        return redis.eval(`
-            local currentTime = ARGV[1]
-            local msgs = redis.call("zrangebyscore", "${invisibleSet}", 0, currentTime);
-            if (table.getn(msgs) > 0) then
-                if (unpack) then
-                    redis.call("lpush", "${workQueue}", unpack(msgs));
-                else
-                    if (table.unpack) then
-                        redis.call("lpush", "${workQueue}", table.unpack(msgs));
-                    end
-                end
-                return redis.call("zremrangebyscore", "${invisibleSet}", 0, currentTime);
-            end
-        `, 0, Date.now());
+export function expireVisibilityFn(redis: Redis, invisibleSet:string, workQueue:string, atBack = true) {
+    return async () => {
+        // @ts-ignore
+        const count = await redis.expireInvisibility(invisibleSet, workQueue, Date.now(), atBack ? "1" : "0");
+        if (count) {
+            console.debug(`Evicted ${count} records from invisible set to the ${atBack ? 'back' : 'front'} of main queue`);
+        }
+        return count;
     }
 }
 
@@ -33,10 +27,13 @@ export function lockingQueueName(workQueue:string) {
 export function invisibleSetName(workQueue:string) {
     return `${workQueue}:invisible`;
 }
+export function priorityRetrySetName(workQueue:string) {
+    return `${workQueue}:priorityretry`;
+}
 
 
 interface ProcessJobFunc {
-    (job: string) : void;
+    (job: DequeueJob) : Promise<void>;
 }
 /**
  * Dequeue a job for processing and mark it invisible for a duration.
@@ -56,7 +53,7 @@ export function workerFn(redis: Redis, jobsQueue:string,
     // To mock error every N attempts
     let loopCount = 0;
 
-    const dequeueJob = async () : Promise<string|null> => {
+    const dequeueJob = async () : Promise<DequeueJob|null> => {
 
         // Move tasks marked as invisible whose timeout has elapsed.
         expireVisibility();
@@ -77,15 +74,14 @@ export function workerFn(redis: Redis, jobsQueue:string,
         }
 
         // Mark message as invisible until timeout
-        const messageToProcess = await redis.eval(`
-            local msg = redis.call("rpop", "${lockingQueue}");
-            if (msg) then
-                redis.call("zadd", "${invisibleSet}", ARGV[1], msg);
-            end
-            return msg;
-        `, 0, Date.now() + invisibilityTimeoutMs);
+        // @ts-ignore
+        const messageTs = await redis.markInvisible(lockingQueue, invisibleSet, invisibilityTimeoutMs);
 
-        return messageToProcess;
+        if (!messageTs[0]) {
+            return null;
+        }
+
+        return {job: messageTs[0], ts: Number.parseInt(messageTs[1])};
     };
 
     return async (process:ProcessJobFunc) => {
@@ -98,7 +94,7 @@ export function workerFn(redis: Redis, jobsQueue:string,
                 while (job && retryRemaining-- > 0) {
                     try {
                         await process(job);
-                        await redis.zrem(invisibleSet, job);
+                        await redis.zrem(invisibleSet, job.job);
                         retryRemaining = 0;
                     } catch (err) {
                         console.error(err, "... Retrying");
@@ -111,6 +107,17 @@ export function workerFn(redis: Redis, jobsQueue:string,
     };
 }
 
+/**
+ * Moves tasks from sourceZset to targetZset if it exists in predicateZset.
+ * Score in target set is by the score in predicate if target is different from source.
+ * Otherwise it is scored by the score in source set.
+ * @param redis 
+ * @param sourceZset 
+ * @param predicateZset 
+ * @param targetZset 
+ * @param sortByZset 
+ * @returns 
+ */
 export async function promoteUntil(redis: Redis,
         sourceZset:string, predicateZset:string, targetZset:string, sortByZset=predicateZset) {
 
@@ -118,37 +125,9 @@ export async function promoteUntil(redis: Redis,
         throw new Error("sortByZset should be either sourceZset or predicateZset");
     }
 
-    const releasedOrdersCmd = `
-    local sourceZset, predicateZset, targetZset, sortByZset = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
-    local count = 0
-    repeat
-        local msgs = redis.call("zrange", sourceZset, 0, 0)
-        if (#msgs > 0) then
-            local rankInPredSet = redis.call("zrank", predicateZset, msgs[1])
-            if (rankInPredSet) then
-                local itemScore = redis.call("zpopmin", sourceZset)
-                local srcItem, srcScore = itemScore[1], itemScore[2]
-                if (targetZset == sourceZset) then
-                    redis.call("zadd", targetZset, srcScore, srcItem)
-                else
-                    local scoreInPredSet = redis.call("zscore", predicateZset, srcItem)
-                    redis.call("zadd", targetZset, scoreInPredSet, srcItem)
-                end
-                redis.call("zremrangebyrank", predicateZset, rankInPredSet, rankInPredSet)
-                count = count + 1
-            else
-                -- Block until the order in the front of the account orders queue is terminated
-                break
-            end
-        else
-            -- Nothing in the account orders queue
-            break
-        end
-    until(false)
-    return count
-    `;
-    
-    return redis.eval(releasedOrdersCmd, 0, sourceZset, predicateZset, targetZset, sortByZset).catch(err => console.error(err));
+    // @ts-ignore
+    return redis.promoteUntil(sourceZset, predicateZset, targetZset, sortByZset)
+        .catch((err:any) => console.error(err));
 }
 
 
@@ -161,16 +140,17 @@ export async function promoteUntil(redis: Redis,
  * @param groupedJobsQueue 
  * @param completedJobsSet 
  */
-export async function markGroupJobComplete(redis:Redis, jobSubmitted:string, jobCompleted:string, completionTimeMs:number,
-    groupedJobsQueue:string, completedJobsSet:string) {
+export async function markGroupJobComplete(redis:Redis, jobSubmitted:DequeueJob, jobCompleted:string, completionTimeMs:number,
+    groupedJobsQueue:string, completedJobsSet:string, jobsQueue:string) {
 
     return redis.pipeline()
         // Replace incomplete order with completed order in the account's orders queue
-        .zrem(groupedJobsQueue, jobSubmitted)
-        .zadd(groupedJobsQueue, Date.now(), jobCompleted)
+        .zrem(groupedJobsQueue, jobSubmitted.job)
+        .zadd(groupedJobsQueue, jobSubmitted.ts, jobCompleted)
         // Mark the order as complete and record order execution time.
         // Order execution time will be used to reorder the completed orders for portfolio update.
         .zadd(completedJobsSet, completionTimeMs, jobCompleted)
+        .zrem(invisibleSetName(jobsQueue), jobSubmitted.job)
         .exec();
 }
 
@@ -181,13 +161,16 @@ export async function markGroupJobComplete(redis:Redis, jobSubmitted:string, job
 * @param groupedJobsQueue 
 * @param jobsQueue 
 */
-export async function markGroupJobIncomplete(redis:Redis, jobSubmitted:string, groupedJobsQueue:string, jobsQueue:string) {
+export async function markGroupJobIncomplete(redis:Redis, jobSubmitted:DequeueJob, groupedJobsQueue:string, jobsQueue:string) {
 
     return redis.pipeline()
         // Update last checked time in account's orders queue. This releases completed orders stuck behind an incomplete order.
-        .zadd(groupedJobsQueue, Date.now(), jobSubmitted)
+        .zadd(groupedJobsQueue, jobSubmitted.ts, jobSubmitted.job)
+        // Add to retry-after set
+        .zadd(priorityRetrySetName(jobsQueue), Date.now()+PRIORITY_RETRY_QUEUE_EVICT_MS, jobSubmitted.job)
         // And cycle the order to the back of orders loop.
-        .lpush(jobsQueue, jobSubmitted)
+        // .lpush(jobsQueue, jobSubmitted.job)
+        .zrem(invisibleSetName(jobsQueue), jobSubmitted.job)
         .exec();
 }
 
@@ -222,4 +205,88 @@ export async function markGroupJobIncomplete(redis:Redis, jobSubmitted:string, g
         firstCmd = false;
     }
     return redis.eval(`return {${cmds}}`, 0);
+}
+
+export function expireInvisibilityRedisFn(redis: Redis) :Redis {
+    redis.defineCommand("expireInvisibility", {
+        numberOfKeys: 0,
+        lua: `
+            local invisibleSet, workQueue, currentTime, atBack = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
+            local msgs = redis.call("zrangebyscore", invisibleSet, 0, currentTime);
+            if (table.getn(msgs) > 0) then
+                if (unpack) then
+                    if (atBack == "0") then
+                        redis.call("rpush", workQueue, unpack(msgs));
+                    else
+                        redis.call("lpush", workQueue, unpack(msgs));
+                    end
+                else
+                    if (table.unpack) then
+                        if (atBack == "0") then
+                            redis.call("rpush", workQueue, table.unpack(msgs));
+                        else
+                            redis.call("lpush", workQueue, table.unpack(msgs));
+                        end
+                    end
+                end
+                return redis.call("zremrangebyscore", invisibleSet, 0, currentTime);
+            end
+            return 0
+        `
+    });
+    return redis;
+}
+
+export function markInvisibleRedisFn(redis: Redis) :Redis {
+    redis.defineCommand('markInvisible', {
+        numberOfKeys: 0,
+        lua: `
+            local lockingQueue, invisibleSet, invisibilityTimeoutMs = ARGV[1], ARGV[2], ARGV[3]
+            local msg = redis.call("rpop", lockingQueue);
+            local ts = redis.call("time")
+            local sec, usec = ts[1], ts[2]
+            ts = sec*1000 + usec/1000
+            if (msg) then
+                redis.call("zadd", invisibleSet, ts+invisibilityTimeoutMs, msg)
+            end
+            return {msg, ts}
+        `
+    });
+    return redis;
+}
+
+export function promoteUntilRedisFn(redis: Redis) :Redis {
+    redis.defineCommand('promoteUntil', {
+        numberOfKeys: 0,
+        lua: `
+            local sourceZset, predicateZset, targetZset, sortByZset = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
+            local count = 0
+            repeat
+                local msgs = redis.call("zrange", sourceZset, 0, 0)
+                if (#msgs > 0) then
+                    local rankInPredSet = redis.call("zrank", predicateZset, msgs[1])
+                    if (rankInPredSet) then
+                        local itemScore = redis.call("zpopmin", sourceZset)
+                        local srcItem, srcScore = itemScore[1], itemScore[2]
+                        if (targetZset == sourceZset) then
+                            redis.call("zadd", targetZset, srcScore, srcItem)
+                        else
+                            local scoreInPredSet = redis.call("zscore", predicateZset, srcItem)
+                            redis.call("zadd", targetZset, scoreInPredSet, srcItem)
+                        end
+                        redis.call("zremrangebyrank", predicateZset, rankInPredSet, rankInPredSet)
+                        count = count + 1
+                    else
+                        -- Block until the order in the front of the account orders queue is terminated
+                        break
+                    end
+                else
+                    -- Nothing in the account orders queue
+                    break
+                end
+            until(false)
+            return count
+        `
+    });
+    return redis;
 }

@@ -21,7 +21,7 @@ function addOpenOrder(order: Order) {
 }
 function addExecTs(order: Order, ts?: number) :Order {
     // Order gets terminated(executed/rejected/cancelled) sometime in the next 20 seconds
-    order.lastExecuted = new Date(ts || (Date.now() + (Math.random() * 10000)));
+    order.lastExecuted = new Date(ts || (Date.now() + (Math.random() * 5000)));
     order.executedDate = order.lastExecuted.toISOString();
     return order;
 }
@@ -43,13 +43,13 @@ function addNOrders(n: number) {
 }
 
 
-const tickers = ["GOOG", "MSFT", "AMZN", "HOOD", "F", "IBM", "TSLA"]
+const tickers = ["GOOG", "MSFT", "AMZN", "HOOD", "F", "IBM", "TSLA", "A"]
 const accounts = ["ABC", "BCD", "CDE", "DEF", "EFG"]
 function pickTicker() {
     return tickers[Math.floor(Math.random() * tickers.length * 0.99)];
 }
 function pickAccount() {
-    return accounts[Math.floor(Math.random() * 0.99)];
+    return accounts[Math.floor(Math.random() * accounts.length * 0.99)];
 }
 
 // Test1
@@ -57,16 +57,16 @@ let currTs = Date.now();
 addOpenOrder(addExecTs(newOrder("RDSA001", "RDS-A", "XYZ"), currTs+10000)); // Executes @broker in 10s
 addNOrders(100);
 addOpenOrder(addExecTs(newOrder( "RDSA002", "RDS-A", "XYZ"), currTs+9500)); // Executes @broker in 9.5s
-addNOrders(100);
+setTimeout(() => addNOrders(150), 5000);
 addOpenOrder(addExecTs(newOrder("RDSA003", "RDS-A", "XYZ"), currTs+14000)); // Executes @broker in 14s
 console.log("SHELL should execute in the order RDSA002, RDSA001, RDSA003")
 
 // Test2
 addOpenOrder(addExecTs(newOrder("AAL001", "AAL", "XYZ"), currTs+2001)); // Executes @broker in 2.001s
-addNOrders(100);
+addNOrders(1000);
 addOpenOrder(addExecTs(newOrder("AAL002", "AAL", "XYZ", "LIMIT"), currTs+10000)); // Executes @broker in 10s
-addNOrders(100);
+setTimeout(() => addNOrders(150), 5000);
 addOpenOrder(addExecTs(newOrder("AAL003", "AAL", "XYZ"), currTs+2000)); // Executes @broker in 2s
-addNOrders(100);
+setTimeout(() => addNOrders(120), 12000);
 addOpenOrder(addExecTs(newOrder("AAL004", "AAL", "XYZ"), currTs+2040)); // Executes @broker in 2.04s
 console.log("AMERICAN AIRLINES should execute in the order AAL003, AAL001, AAL004, AAL002")
