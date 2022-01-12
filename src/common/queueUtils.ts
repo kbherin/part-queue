@@ -118,18 +118,13 @@ export function workerFn(redis: Redis, jobsQueue:string,
  * @param sourceZset 
  * @param predicateZset 
  * @param targetZset 
- * @param sortByZset 
  * @returns 
  */
 export async function promoteUntil(redis: Redis,
-        sourceZset:string, predicateZset:string, targetZset:string, sortByZset=predicateZset) {
-
-    if (sortByZset != sourceZset && sortByZset != predicateZset) {
-        throw new Error("sortByZset should be either sourceZset or predicateZset");
-    }
+        sourceZset:string, predicateZset:string, targetZset:string) {
 
     // @ts-ignore
-    return redis.promoteUntil(sourceZset, predicateZset, targetZset, sortByZset)
+    return redis.promoteUntil(sourceZset, predicateZset, targetZset)
         .catch((err:any) => console.error(err));
 }
 
@@ -262,7 +257,7 @@ export function promoteUntilRedisFn(redis: Redis) :Redis {
     redis.defineCommand('promoteUntil', {
         numberOfKeys: 0,
         lua: `
-            local sourceZset, predicateZset, targetZset, sortByZset = ARGV[1], ARGV[2], ARGV[3], ARGV[4]
+            local sourceZset, predicateZset, targetZset = ARGV[1], ARGV[2], ARGV[3]
             local count = 0
             repeat
                 local msgs = redis.call("zrange", sourceZset, 0, 0)
